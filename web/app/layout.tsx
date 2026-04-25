@@ -13,7 +13,7 @@ export const metadata: Metadata = {
   description:
     "Tell MedOS what's bothering you. Instant, private, multilingual health guidance aligned with WHO, CDC, and NHS.",
   keywords: ["medical AI", "healthcare", "chatbot", "telemedicine", "WHO", "CDC"],
-  authors: [{ name: "MedOS Team" }],
+  authors: [{ name: "Sujal" }],
   manifest: "/manifest.webmanifest",
   icons: {
     icon: [{ url: "/favicon.svg", type: "image/svg+xml" }],
