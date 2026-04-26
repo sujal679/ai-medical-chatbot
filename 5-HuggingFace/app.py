@@ -36,7 +36,7 @@ from langchain_core.callbacks import CallbackManagerForRetrieverRun
 print_full_prompt=False
 
 ## Step 1 Dataset Retrieving
-dataset = load_dataset("sujal/ai-medical-chatbot")
+dataset = load_dataset("ruslanmv/ai-medical-chatbot")
 clear_output()
 train_data = dataset["train"]
 #For this demo let us choose the first 1000 dialogues
@@ -63,36 +63,59 @@ id_answer = df.set_index('id')['answer'].to_dict()
 
 load_dotenv()
 
-## Step 2 Milvus connection
-
+# Step 2 Milvus connection (with Fallback)
 COLLECTION_NAME='qa_medical'
 load_dotenv()
 host_milvus = os.environ.get("REMOTE_SERVER", '127.0.0.1')
-connections.connect(host=host_milvus, port='19530')
 
+USE_MILVUS = False
+try:
+    connections.connect(host=host_milvus, port='19530', timeout=5)
+    collection = Collection(COLLECTION_NAME)      
+    collection.load(replica_number=1)
+    utility.load_state(COLLECTION_NAME)
+    USE_MILVUS = True
+    print("Successfully connected to Milvus!")
+except Exception as e:
+    print(f"Milvus not found or connection failed: {e}")
+    print(">>> RUNNING IN LOCAL FALLBACK MODE (No Milvus required) <<<")
 
-collection = Collection(COLLECTION_NAME)      
-collection.load(replica_number=1)
-utility.load_state(COLLECTION_NAME)
-utility.loading_progress(COLLECTION_NAME)
+max_input_length = 500  
 
-max_input_length = 500  # Maximum length allowed by the model
-# Create the combined pipe for question encoding and answer retrieval
-combined_pipe = (
-    pipe.input('question')
-        .map('question', 'vec', lambda x: x[:max_input_length])  # Truncate the question if longer than 512 tokens
-        .map('vec', 'vec', ops.text_embedding.dpr(model_name='facebook/dpr-ctx_encoder-single-nq-base'))
-        .map('vec', 'vec', lambda x: x / np.linalg.norm(x, axis=0))
-        .map('vec', 'res', ops.ann_search.milvus_client(host=host_milvus, port='19530', collection_name=COLLECTION_NAME, limit=1))
-        .map('res', 'answer', lambda x: [id_answer[int(i[0])] for i in x])
-        .output('question', 'answer')
-)
+# Define the combined pipe
+if USE_MILVUS:
+    combined_pipe = (
+        pipe.input('question')
+            .map('question', 'vec', lambda x: x[:max_input_length])
+            .map('vec', 'vec', ops.text_embedding.dpr(model_name='facebook/dpr-ctx_encoder-single-nq-base'))
+            .map('vec', 'vec', lambda x: x / np.linalg.norm(x, axis=0))
+            .map('vec', 'res', ops.ann_search.milvus_client(host=host_milvus, port='19530', collection_name=COLLECTION_NAME, limit=1))
+            .map('res', 'answer', lambda x: [id_answer[int(i[0])] for i in x])
+            .output('question', 'answer')
+    )
+else:
+    # Simple keyword search fallback if Milvus is missing
+    def simple_fallback_search(question):
+        if isinstance(question, list):
+            question = question[0] if question else ""
+        question = str(question).lower()
+        # Find matches in the dataframe
+        matches = df[df['question'].str.lower().str.contains(question[:20], na=False)]
+        if not matches.empty:
+            return [matches.iloc[0]['answer']]
+        return ["I'm sorry, I don't have specific information on that in my local cache. How else can I help?"]
+
+    def fallback_pipe(question):
+        ans = simple_fallback_search(question)
+        return [{'question': question, 'answer': ans}]
+    
+    combined_pipe = fallback_pipe
 
 # Step 3  - Custom LLM - Using Groq API
 import os
 from groq import Groq
 
-def generate_stream(prompt, model="mixtral-8x7b"):
+def generate_stream(prompt, model="mixtral-8x7b-32768"):
     """
     Generate streaming response using Groq API
     Get your free API key from: https://console.groq.com
@@ -136,15 +159,32 @@ def format_prompt_zephyr(message, history, system_message):
 # Step 4 Langchain Definitions
 
 class CustomRetrieverLang(BaseRetriever): 
-    def get_relevant_documents(
-        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
     ) -> List[Document]:
         # Perform the encoding and retrieval for a specific question
         ans = combined_pipe(query)
-        ans = DataCollection(ans)
-        answer=ans[0]['answer']
-        answer_string = ' '.join(answer)
-        return [Document(page_content=answer_string)]   
+        
+        # Robustly extract the answer whether it's from Towhee or our Local Fallback
+        if isinstance(ans, list) and len(ans) > 0:
+            if isinstance(ans[0], dict) and 'answer' in ans[0]:
+                answer = ans[0]['answer']
+            else:
+                answer = ans
+        else:
+            try:
+                from towhee.datacollection import DataCollection
+                ans_dc = DataCollection(ans)
+                answer = ans_dc[0]['answer']
+            except:
+                answer = str(ans)
+
+        if isinstance(answer, list):
+            answer_string = ' '.join(map(str, answer))
+        else:
+            answer_string = str(answer)
+            
+        return [Document(page_content=answer_string)]
 # Ensure correct VectorStoreRetriever usage
 retriever = CustomRetrieverLang()
 
@@ -236,22 +276,15 @@ class MyCustomLLM(BaseLLM):
 
     def _generate(
         self,
-        prompt: str,
-        *,
-        temperature: float = 0.7,
-        max_tokens: int = 256,
-        top_p: float = 0.95,
+        prompts: list[str],
         stop: list[str] = None,
         **kwargs,
-    ) -> LLMResult:  # Change return type to LLMResult
+    ) -> LLMResult:
+        prompt = prompts[0] if isinstance(prompts, list) else prompts
         response_text = custom_llm(
             question=prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
             stop=stop,
         )
-        # Convert the response text to LLMResult format
         response = LLMResult(generations=[[{'text': response_text}]])
         return response
 
@@ -276,11 +309,12 @@ def chat(message, history):
     history.append((message, response))
     return history, response
 
-def chat_v1(message, history):
+def chat_v1(message):
     response = rag_chain.invoke(message)
     return (response)
 
-collection.load()
+if USE_MILVUS:
+    collection.load()
 # Create a Gradio interface
 import gradio as gr
 
